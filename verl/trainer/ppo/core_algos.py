@@ -23,6 +23,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -107,6 +108,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_VECTORIZED = "grpo_vectorized"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
+    GDPO = "gdpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -325,7 +327,6 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
-
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
@@ -349,14 +350,123 @@ def compute_grpo_vectorized_outcome_advantage(
     with torch.no_grad():
         scores = token_level_rewards.sum(dim=-1)
         g = as_torch_index(index, device=scores.device)
-        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon)
+        mean_g, std_g, _ = group_mean_std(scores, g, eps=0.0, device=scores.device)
         if norm_adv_by_std_in_grpo:
             scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
         else:
             scalars = scores - mean_g[g]
-
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
+def compute_gdpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    batch: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    GDPO: Group reward-Decoupled Normalization Policy Optimization.
+
+    Instead of summing all reward dimensions first (like GRPO), GDPO normalizes
+    each reward dimension independently within each group before aggregation.
+    This prevents a dominant reward signal from drowning out weaker ones.
+
+    Mathematical formulation:
+        Step 1 – Group-wise decoupled normalization (via GRPO per dimension):
+            For each reward dimension k, within each group g:
+            A_k = (r_k - μ_group(r_k)) / (σ_group(r_k) + ε)
+
+        Step 2 – Weighted aggregation:
+            A_sum = Σ_k w_k · A_k
+
+        Step 3 – Batch-level normalization (via masked_whiten):
+            A_final = whiten(A_sum, response_mask)
+
+    Args:
+        token_level_rewards: (bs, response_length) – standard token-level rewards.
+            Used as fallback when per-dimension rewards are not provided.
+        response_mask: (bs, response_length)
+        index: (bs,) – group id per sample (from ``uid``).
+        epsilon: Numerical stability constant.
+        norm_adv_by_std_in_grpo: Whether to normalize by std in GRPO.
+        config: Algorithm configuration (optional).
+        non_tensor_batch: Non-tensor batch data containing per-dimension reward scores.
+        batch: Batch data containing prompts, attention_mask, etc.
+
+    Note:
+        Ref GDPO (https://arxiv.org/abs/2601.05242).
+
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length) – same as advantages (outcome-only).
+    """
+    score_list = None
+    reward_weights = None
+
+    if config is not None and non_tensor_batch is not None and batch is not None:
+        gdpo_reward_keys = config.get("gdpo_reward_keys", None)
+        assert gdpo_reward_keys, (
+            "GDPO requires 'algorithm.gdpo_reward_keys' listing the individual reward "
+            "component keys returned by compute_score (e.g. ['format_reward', 'accuracy_reward'])."
+        )
+        device = token_level_rewards.device
+        prompt_length = batch["prompts"].size(1)
+        valid_response_length = batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
+
+        score_list = []
+        for key in gdpo_reward_keys:
+            assert key in non_tensor_batch, (
+                f"GDPO reward key '{key}' not found in non_tensor_batch. "
+                f"Available keys: {list(non_tensor_batch.keys())}. "
+                f"Make sure your compute_score returns a dict containing '{key}'."
+            )
+            comp = non_tensor_batch[key]
+            rm_score = torch.tensor(np.asarray(comp, dtype=np.float32), device=device)
+            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            rm_scores[torch.arange(rm_scores.size(0), device=device), valid_response_length] = rm_score
+            score_list.append(rm_scores)
+
+        gdpo_weights = config.get("gdpo_reward_weights", None)
+        if gdpo_weights is not None:
+            reward_weights = list(gdpo_weights)
+
+    if score_list is None:
+        score_list = [token_level_rewards]
+
+    num_scores = len(score_list)
+
+    if reward_weights is not None:
+        weights = torch.tensor(reward_weights, dtype=torch.float32, device=token_level_rewards.device)
+    else:
+        weights = torch.ones(num_scores, dtype=torch.float32, device=token_level_rewards.device)
+
+    new_advantage = None
+
+    for i in range(num_scores):
+        normalized_score, _ = compute_grpo_outcome_advantage(
+            token_level_rewards=score_list[i],
+            response_mask=response_mask,
+            index=index,
+            epsilon=epsilon,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+
+        if new_advantage is None:
+            new_advantage = weights[i] * normalized_score
+        else:
+            new_advantage += weights[i] * normalized_score
+
+    advantages = verl_F.masked_whiten(new_advantage, response_mask) * response_mask
+
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
@@ -765,8 +875,9 @@ def compute_optimal_token_baseline_advantage(
     old_log_probs: torch.Tensor,
     sum_pi_squared: torch.Tensor,
     rollout_is_weights: torch.Tensor = None,
-    handle_zero_tail: bool = False,
+    handle_zero_tail: bool = True,
     epsilon: float = 1e-8,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantages using Optimal Token Baseline (OTB).
@@ -793,7 +904,7 @@ def compute_optimal_token_baseline_advantage(
             None if not using IS
         handle_zero_tail: If True, zero baselines will be set in the portion of the longest trajectory
             that extends beyond the second-longest trajectory in the prompt group.
-            Default: False
+            Default: True
         epsilon: Small constant for numerical stability (default: 1e-8)
 
     Returns:
@@ -885,6 +996,7 @@ def compute_multi_turn_optimal_token_baseline_advantage(
     rollout_is_weights: torch.Tensor = None,
     handle_zero_tail: bool = True,
     epsilon: float = 1e-8,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantages using Optimal Token Baseline (OTB).
@@ -1056,26 +1168,32 @@ def agg_loss(
     """
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
+            if dp_size > 1:
+                raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
-    elif loss_agg_mode == "seq-mean-token-sum":
+    elif loss_agg_mode in ["seq-mean-token-sum", "seq-mean-token-sum-norm"]:
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            if loss_scale_factor is None:
+                horizon = loss_mask.shape[-1]
+                loss_scale_factor = horizon
+            loss /= loss_scale_factor
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
-    elif loss_agg_mode == "seq-mean-token-sum-norm":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        if loss_scale_factor is None:
-            loss_scale_factor = loss_mask.shape[-1]
-        loss = torch.sum(seq_losses) / loss_scale_factor
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
@@ -1096,6 +1214,27 @@ def compute_self_distillation_loss(
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the SDPO distillation loss for actor updates.
+
+    Args:
+        student_log_probs: Student token log-probabilities, shape (batch_size, response_length).
+        teacher_log_probs: Teacher token log-probabilities, shape (batch_size, response_length).
+        response_mask: Response token mask, shape (batch_size, response_length).
+        self_distillation_config: SDPO self-distillation config object.
+        old_log_probs: Optional old policy log-probabilities for IS clipping.
+        student_all_log_probs: Optional student full-vocab log-probabilities for full-logit distillation.
+        teacher_all_log_probs: Optional teacher full-vocab log-probabilities for full-logit distillation.
+        student_topk_log_probs: Optional student top-k log-probabilities for top-k distillation.
+        teacher_topk_log_probs: Optional teacher top-k log-probabilities for top-k distillation.
+        self_distillation_mask: Optional per-sample SDPO mask; masked samples are excluded from distillation.
+        loss_agg_mode: Loss aggregation mode.
+        rollout_is_weights: Optional rollout correction IS weights.
+
+    Returns:
+        tuple[torch.Tensor, dict[str, Any]]:
+            - Distillation loss scalar.
+            - Metrics dictionary for debugging and monitoring.
+    """
 
     metrics = {}
 
@@ -1103,8 +1242,10 @@ def compute_self_distillation_loss(
     if self_distillation_mask is not None:
         loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
 
+    distill_variant = "rkl_token"
     if self_distillation_config.full_logit_distillation:
         use_topk = self_distillation_config.distillation_topk is not None
+        distill_variant = "full_logit_topk" if use_topk else "full_logit_all"
         if use_topk:
             if student_topk_log_probs is None or teacher_topk_log_probs is None:
                 raise ValueError("top-k distillation requires student_topk_log_probs and teacher_topk_log_probs.")
@@ -1113,8 +1254,10 @@ def compute_self_distillation_loss(
                 # Compute tail log-probability using logsumexp for numerical stability
                 # log(1 - sum(p_i)) = log(1 - exp(log_sum_exp(log(p_i))))
                 log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
-                log_s = torch.clamp(log_s, max=-1e-7)  # Clamp to avoid log_s >= 0 (which implies sum(probs) >= 1)
-                tail_log = torch.log(-torch.expm1(log_s))  # We use the identity: 1 - exp(x) = -(exp(x) - 1); torch.expm1(x) computes (e^x - 1) with high precision for small x.
+                # Clamp to avoid log_s >= 0 (sum(probs) >= 1).
+                log_s = torch.clamp(log_s, max=-1e-7)
+                # 1 - exp(x) = -(exp(x) - 1) with better precision from expm1.
+                tail_log = torch.log(-torch.expm1(log_s))
                 return torch.cat([log_probs, tail_log], dim=-1)
 
             def renorm_topk_log_probs(logp: torch.Tensor) -> torch.Tensor:
@@ -1135,15 +1278,14 @@ def compute_self_distillation_loss(
             student_distill_log_probs = student_all_log_probs
             teacher_distill_log_probs = teacher_all_log_probs
 
+        kl_type_code = 0.0
         if self_distillation_config.alpha == 0.0:
-            kl_loss = F.kl_div(
-                student_distill_log_probs, teacher_distill_log_probs, reduction="none", log_target=True
-            )
+            kl_loss = F.kl_div(student_distill_log_probs, teacher_distill_log_probs, reduction="none", log_target=True)
         elif self_distillation_config.alpha == 1.0:
-            kl_loss = F.kl_div(
-                teacher_distill_log_probs, student_distill_log_probs, reduction="none", log_target=True
-            )
+            kl_type_code = 1.0
+            kl_loss = F.kl_div(teacher_distill_log_probs, student_distill_log_probs, reduction="none", log_target=True)
         else:
+            kl_type_code = 2.0
             # Compute the log of the mixture distribution
             # log(a + b) = log(exp(log(a)) + exp(log(b))) -> for mixture
             alpha = torch.tensor(
@@ -1152,12 +1294,18 @@ def compute_self_distillation_loss(
                 device=student_distill_log_probs.device,
             )
             mixture_log_probs = torch.logsumexp(
-                torch.stack([student_distill_log_probs + torch.log(1 - alpha), teacher_distill_log_probs + torch.log(alpha)]),
+                torch.stack(
+                    [
+                        student_distill_log_probs + torch.log(1 - alpha),
+                        teacher_distill_log_probs + torch.log(alpha),
+                    ]
+                ),
                 dim=0,
             )
             kl_teacher = F.kl_div(mixture_log_probs, teacher_distill_log_probs, reduction="none", log_target=True)
             kl_student = F.kl_div(mixture_log_probs, student_distill_log_probs, reduction="none", log_target=True)
-            kl_loss = torch.lerp(kl_student, kl_teacher, alpha)  # Compute the Generalized Jensen-Shannon Divergence
+            # Compute the generalized Jensen-Shannon divergence.
+            kl_loss = torch.lerp(kl_student, kl_teacher, alpha)
 
         per_token_loss = kl_loss.sum(-1)
     else:
@@ -1184,6 +1332,27 @@ def compute_self_distillation_loss(
         loss_mask=loss_mask,
         loss_agg_mode=loss_agg_mode,
         batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+    )
+    metrics.update(
+        {
+            "self_distillation/loss": loss.detach().item(),
+            "self_distillation/alpha": float(self_distillation_config.alpha),
+            "self_distillation/full_logit_distillation": float(self_distillation_config.full_logit_distillation),
+            "self_distillation/use_topk": float(self_distillation_config.distillation_topk is not None),
+            "self_distillation/topk_value": float(self_distillation_config.distillation_topk or 0),
+            "self_distillation/mask_fraction": loss_mask.float().mean().item(),
+            "self_distillation/variant_code": {
+                "rkl_token": 3.0,
+                "full_logit_topk": 1.0,
+                "full_logit_all": 0.0,
+            }[distill_variant],
+            "self_distillation/kl_type_code": (
+                kl_type_code if self_distillation_config.full_logit_distillation else 3.0
+            ),
+            "self_distillation/is_clip": (
+                float(self_distillation_config.is_clip) if self_distillation_config.is_clip is not None else -1.0
+            ),
+        }
     )
     return loss, metrics
 
@@ -1349,6 +1518,172 @@ def compute_policy_loss_vanilla(
     pg_loss = agg_loss(
         loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("dppo_tv")
+def compute_policy_loss_dppo_tv(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute the clipped policy objective and related metrics for DPPO-Binary-TV.
+
+    See https://arxiv.org/pdf/2602.04879 for more details.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        config: `(verl.trainer.config.ActorConfig)`:
+            config for the actor.
+        rollout_log_probs: `(torch.Tensor)`:
+            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+    """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    # Note: the clip_ratio is different from the standard PPO, it is the TV divergence threshold for DPPO.
+    clip_divergence = config.clip_ratio
+    clip_divergence_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_divergence
+    clip_divergence_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_divergence
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    # Instead of dual-clip PPO, we use truncated importance sampling (TIS) to clip the policy loss.
+    # However, a large threshold is recommended to avoid performance degradation due to the truncation bias.
+    # See Section 5.4 in https://arxiv.org/pdf/2602.04879 for more details.
+    clip_ratio_c = config.get("clip_ratio_c", 20.0)
+    truncated_ratio = torch.clamp(ratio, max=clip_ratio_c)
+    truncated_ratio = truncated_ratio.detach()
+
+    # Compute valid mask for DPPO-Binary-TV
+    prob = torch.exp(log_prob)
+    old_prob = torch.exp(old_log_prob)
+    valid_positive_mask = (prob - old_prob) <= clip_divergence_high
+    valid_negative_mask = (prob - old_prob) >= -clip_divergence_low
+    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
+    valid_mask = valid_mask.detach().float()
+
+    pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
+
+    # Apply rollout correction weights if provided
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((ratio > clip_ratio_c).float() * valid_mask, response_mask)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("dppo_kl")
+def compute_policy_loss_dppo_kl(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute the clipped policy objective and related metrics for DPPO-Binary-KL.
+
+    See https://arxiv.org/pdf/2602.04879 for more details.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        config: `(verl.trainer.config.ActorConfig)`:
+            config for the actor.
+        rollout_log_probs: `(torch.Tensor)`:
+            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+    """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    # Note: the clip_ratio is different from the standard PPO, it is the KL divergence threshold for DPPO.
+    clip_divergence = config.clip_ratio
+    clip_divergence_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_divergence
+    clip_divergence_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_divergence
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    # Instead of dual-clip PPO, we use truncated importance sampling (TIS) to clip the policy loss.
+    # However, a large threshold is recommended to avoid performance degradation due to the truncation bias.
+    # See Section 5.4 in https://arxiv.org/pdf/2602.04879 for more details.
+    clip_ratio_c = config.get("clip_ratio_c", 20.0)
+    truncated_ratio = torch.clamp(ratio, max=clip_ratio_c)
+    truncated_ratio = truncated_ratio.detach()
+
+    # Compute valid mask for DPPO-Binary-KL
+    prob = torch.exp(log_prob)
+    old_prob = torch.exp(old_log_prob)
+    binary_kl = old_prob * (old_log_prob - log_prob) + (1 - old_prob) * torch.log(
+        (1.0 - old_prob + 1e-8) / (1.0 - prob + 1e-8)
+    )
+    valid_positive_mask = (binary_kl <= clip_divergence_high) | (prob <= old_prob)
+    valid_negative_mask = (binary_kl <= clip_divergence_low) | (prob >= old_prob)
+    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
+    valid_mask = valid_mask.detach().float()
+
+    pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
+
+    # Apply rollout correction weights if provided
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    # For compatibility, return zero for pg_clipfrac_lower (not used in standard DPPO)
+    pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((ratio > clip_ratio_c).float() * valid_mask, response_mask)
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
@@ -1958,14 +2293,16 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     Returns:
         kl_estimate
     """
-    forward_score = kl_penalty_forward(logprob, ref_logprob, kl_penalty)
+    # Strip the optional '+' suffix so e.g. "k3+" dispatches to "k3".
+    base_kl_penalty = kl_penalty[:-1] if kl_penalty.endswith("+") else kl_penalty
+    forward_score = kl_penalty_forward(logprob, ref_logprob, base_kl_penalty)
     if not kl_penalty.endswith("+") or kl_penalty in ("mse", "k2"):
         return forward_score
 
     """
-    The expectation of k1 and k3 estimator is the expectaed value of KL, but the expected gradient of k1 and k3
-    estimator is not the expectaed gradient of KL. On the other hand k2 estimator gives right gradient estimator,
-    so we use a straight through trick here if the kl_penalty method ends with '+', .e.g., k3+.
+    The expectation of k1 and k3 estimator is the expected value of KL, but the expected gradient of k1 and k3
+    estimator is not the expected gradient of KL. On the other hand k2 estimator gives right gradient estimator, 
+    so we use a straight through trick here if the kl_penalty method ends with '+', e.g., k3+. 
     """
     backward_score = 0.5 * (logprob - ref_logprob).square()
 

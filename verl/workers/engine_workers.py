@@ -11,42 +11,72 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import logging
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from functools import partial
 from itertools import chain
-from typing import Any, Optional
+from typing import Optional
 
+import psutil
 import torch
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
+from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import (
-    get_device_name,
-    get_torch_device,
-    set_expandable_segments,
-)
-from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
+from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
-from verl.workers.config import ActorConfig, HFModelConfig, RolloutConfig, TrainingWorkerConfig
+from verl.workers.config import (
+    ActorConfig,
+    DistillationConfig,
+    HFModelConfig,
+    MtpConfig,
+    RolloutConfig,
+    TrainingWorkerConfig,
+)
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
-from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.losses import _sdpo_teacher_extractor, ppo_loss, sdpo_ppo_loss
+from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+from verl.workers.utils.sdpo import (
+    TrustRegionTeacher,
+    has_non_empty_multi_modal_inputs,
+    reconstruct_padded_teacher_from_nested,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _with_routing_replay_flag(enabled: bool):
+    """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, data: TensorDict, *args, **kwargs):
+            if self.enable_routing_replay:
+                tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+            return func(self, data, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
@@ -63,6 +93,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         initialize_global_process_group_ray(timeout_second=None)
 
+        set_numa_affinity()
+
         self.config = config
         self.model_config = self.config.model_config
         self.engine_config = self.config.engine_config
@@ -70,10 +102,23 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.checkpoint_config = self.config.checkpoint_config
         self.device_name = get_device_name()
 
-        # we use the one defined in model
-        self.engine_config.use_remove_padding = self.model_config.use_remove_padding
+        if self.engine_config is None:
+            assert self.optimizer_config is None
+            if self.config.auto_select_engine_optim_fn is None:
+                raise ValueError(
+                    "engine_config is not provided and auto_select_engine_optim_fn is not set. "
+                    "Cannot determine engine backend."
+                )
+            # Support automatically select engine backend given model config
+            self.engine_config, self.optimizer_config = self.config.auto_select_engine_optim_fn(
+                self.model_config, self.device_name
+            )
 
-        # TODO: add DistProfilerExtension
+        # we use the one defined in model
+        # TODO: this is not elegant and should refactor later
+        self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
+        self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
+
         self.profiler_config = self.config.profiler_config
         if self.profiler_config is not None:
             self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})
@@ -84,6 +129,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=self.profiler_tool_config)
         )
 
+        self.model_config.model_type = self.config.model_type
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
@@ -100,7 +146,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             is_collect=self.engine.is_mp_src_rank_with_outputs(),
         )
 
-        self.flops_counter = FlopsCounter(self.model_config.hf_config)
+        if hasattr(self.model_config, "hf_config"):
+            self.flops_counter = FlopsCounter(self.model_config.hf_config)
+        else:
+            self.flops_counter = None
 
         self.loss_fn = None
 
@@ -126,7 +175,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         """
         self.engine.initialize()
 
-    def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only):
+    def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
 
         Args:
@@ -135,42 +184,62 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Returns:
 
         """
-        # TODO: whether to log memory
-        # metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024 ** 3)
-        # metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024 ** 3)
-        # metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024 ** 3)
 
         metrics: dict = output.pop("metrics")
         # perform all gather in dp group to ensure that it's correct.
         # Here each metric in metrics can be a list (micro-batch metrics) or a singleton
         # we should always sum the loss of each micro-batch as we scale by global_bsz/global_token
         loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
-        torch.distributed.all_reduce(
-            loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
-        )
+        dp_group = self.engine.get_data_parallel_group()
+        if dp_group is not None:
+            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
         loss = loss.item()
 
         # For grad_norm, we do not perform all reduce because it is already been done when clipping grad
         grad_norm = metrics.pop("grad_norm", None)
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
+        # A forward-only pass performs no optimizer step, so it never updates the model; the engine
+        # only sets `did_update` on the training path (see EngineBase.train_batch), so default to
+        # `not forward_only` here.
+        did_update = output.pop("did_update", not forward_only)
 
-        # For other metrics, we perform all gather in dp group
-        final_metrics = allgather_dict_into_dict(data=metrics, group=self.engine.get_data_parallel_group())
+        # For other metrics, we perform all gather in dp group (only if DP > 1)
+        if dp_group is not None:
+            final_metrics = allgather_dict_into_dict(data=metrics, group=dp_group)
+        else:
+            final_metrics = metrics
         final_metrics["loss"] = loss
         if grad_norm is not None:
             final_metrics["grad_norm"] = grad_norm
         if lr is not None:
             final_metrics["lr"] = lr
+
+        # log memory
+        final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+        final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+        final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+        # TODO: confirm the mtp loss IS same across dp
+        for k, v in final_metrics.items():
+            if k.startswith("mtp_losses"):
+                flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
+                final_metrics[k] = sum(flatten_v) / len(flatten_v)
         # compute mfu
-        if global_token_num is not None:
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_token_num, delta_time)
+        if global_token_num is not None and self.flops_counter is not None:
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(
+                global_token_num, delta_time, images_seqlens=images_seqlens
+            )
             final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
             if forward_only:
                 final_metrics["mfu"] /= 3.0
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics
-        final_output = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics})
+        final_output = tu.get_tensordict(
+            tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics, "did_update": did_update}
+        )
         return final_output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
@@ -222,13 +291,19 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 # add global token num
-                global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
-                # allgather from dp rank
-                global_token_num_output = [None] * self.engine.get_data_parallel_size()
-                torch.distributed.all_gather_object(
-                    global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
-                )
-                global_token_num = [x for xs in global_token_num_output for x in xs]
+                if "input_ids" in mini_batch_td:
+                    global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
+                    # allgather from dp rank
+                    global_token_num_output = [None] * torch.distributed.get_world_size(
+                        self.engine.get_data_parallel_group()
+                    )
+                    torch.distributed.all_gather_object(
+                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+                    )
+                    global_token_num = [x for xs in global_token_num_output for x in xs]
+                else:
+                    global_token_num = None
+
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
@@ -239,6 +314,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
+                did_update = any(tu.get_non_tensor_data(output, "did_update", default=True) for output in output_lst)
+
                 actor_output = [tu.get(output, "metrics") for output in output_lst]
                 metrics = {}
                 for output in actor_output:
@@ -246,26 +323,32 @@ class TrainingWorker(Worker, DistProfilerExtension):
                         # flattn dp and micro batch
                         if isinstance(val, list):
                             output[key] = (
-                                Metric.chain(val) if isinstance(val[0], Metric) else list(chain.from_iterable(val))
+                                Metric.aggregate_dp(val)
+                                if isinstance(val[0], Metric)
+                                else list(chain.from_iterable(val))
                             )
                     append_to_dict(metrics, output)
 
-                output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
+                output = tu.get_tensordict(
+                    tensor_dict={}, non_tensor_dict={"metrics": metrics, "did_update": did_update}
+                ).cpu()
             else:
                 output = None
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    @DistProfiler.annotate(color="red", role="train_batch")
     def train_batch(self, data: TensorDict) -> TensorDict:
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
         # global_token_num should be a list of number of tokens of each seq in this batch
         global_token_num = tu.get(data, key="global_token_num")
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
+        images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
         # inject engineering parameters if not specified
         default_keys = dict(
-            use_remove_padding=self.model_config.use_remove_padding,
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
             max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
@@ -298,7 +381,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if lr is not None:
                 output["metrics"]["lr"] = lr
             final_output = self._postprocess_output(
-                output, global_token_num=global_token_num, delta_time=delta_time, forward_only=False
+                output,
+                global_token_num=global_token_num,
+                delta_time=delta_time,
+                forward_only=False,
+                images_seqlens=images_seqlens,
             ).cpu()
         else:
             final_output = None
@@ -312,9 +399,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         compute_loss = tu.get(data, key="compute_loss", default=True)
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
+        images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
         default_keys = dict(
-            use_remove_padding=self.model_config.use_remove_padding,
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
             max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
@@ -339,7 +427,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         if self.engine.is_mp_src_rank_with_outputs():
             final_output = self._postprocess_output(
-                output, global_token_num=global_token_num, delta_time=delta_time, forward_only=True
+                output,
+                global_token_num=global_token_num,
+                delta_time=delta_time,
+                forward_only=True,
+                images_seqlens=images_seqlens,
             ).cpu()
         else:
             final_output = None
@@ -362,9 +454,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     NOTE: ActorRolloutRefWorker no longer support spmd mode and run native server mode.
     """
 
-    def __init__(self, config: DictConfig, role: str, **kwargs):
+    def __init__(
+        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
+    ):
         Worker.__init__(self)
         self.config = config
+        self.distillation_config = distillation_config
+        self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.role = role
         self.actor: TrainingWorker = None
         self.ref: TrainingWorker = None
@@ -384,12 +480,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             omega_profiler_config = config.ref.get("profiler", {})
 
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
             tool_config = omega_conf_to_dataclass(
                 omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
             )
         else:
             tool_config = None
+
+        # Router replay is supported on the megatron engine and on the veomni
+        # engine. Both expose `router_replay` on their per-strategy engine
+        # config (the field lives on the shared `EngineConfig` base).
+        actor_strategy = self.config.actor.strategy
+        if actor_strategy == "megatron":
+            rr_mode = self.config.actor.megatron.router_replay.mode
+        elif actor_strategy == "veomni":
+            rr_mode = self.config.actor.veomni.router_replay.mode
+        else:
+            rr_mode = "disabled"
+        self.enable_routing_replay = rr_mode != "disabled"
+
+        # SDPO detection
+        sdpo_cfg = config.actor.get("self_distillation", None) if self._is_actor else None
+        sdpo_loss_mode = config.actor.policy_loss.get("loss_mode", "vanilla") if self._is_actor else "vanilla"
+        self.sdpo_enabled = sdpo_cfg is not None and sdpo_loss_mode == "sdpo"
+        self.sdpo_config = None  # populated in init_model
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
@@ -406,6 +520,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("actor_init_model"): breakpoint()
+
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -420,11 +537,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_dynamic_bsz = self.config.ref.pop("log_prob_use_dynamic_bsz", False)
                 self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
-            ref_config.model_config = model_config
+
+            # The ref model does not need to enable MTP; force it to false.
+            ref_config.model_config = deepcopy(model_config)
+            ref_config.model_config.mtp = MtpConfig(enable=False)
 
             # construct TrainingWorkerConfig
             ref_training_config = TrainingWorkerConfig(
-                model_type="language_model",
+                model_type=ref_config.model_config.get("model_type", "language_model"),
                 model_config=ref_config.model_config,
                 engine_config=ref_config.engine,
                 optimizer_config=ref_config.optim,
@@ -437,7 +557,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
                 self.config.ref.ppo_micro_batch_size_per_gpu
             )
-            ref_training_config.engine_config.use_remove_padding = model_config.use_remove_padding
+            ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
@@ -447,9 +567,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if "actor" in self.role:
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
+            distillation_config: Optional[DistillationConfig] = (
+                omega_conf_to_dataclass(self.distillation_config) if self.distillation_enabled else None
+            )
 
             actor_training_config = TrainingWorkerConfig(
-                model_type="language_model",
+                model_type=actor_config.model_config.get("model_type", "language_model"),
                 model_config=actor_config.model_config,
                 engine_config=actor_config.engine,
                 optimizer_config=actor_config.optim,
@@ -470,7 +593,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_training_config.engine_config.micro_batch_size_per_gpu = (
                 self.config.actor.ppo_micro_batch_size_per_gpu
             )
-            actor_training_config.engine_config.use_remove_padding = model_config.use_remove_padding
+            actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
             if self.config.actor.use_dynamic_bsz:
                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None
@@ -478,19 +601,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
+            if self.sdpo_enabled:
+                from verl.utils.config import omega_conf_to_dataclass as _to_dc
+                from verl.workers.config.actor import SelfDistillationConfig
 
-            self.loss_fn = partial(ppo_loss, config=actor_config)
+                self.sdpo_config = _to_dc(self.config.actor.self_distillation, SelfDistillationConfig)
+                if self.sdpo_config.full_logit_distillation:
+                    actor_uses_fused_kernels = actor_training_config.engine_config.use_fused_kernels
+                    ref_uses_fused_kernels = self.ref is not None and self.ref.engine_config.use_fused_kernels
+                    if actor_uses_fused_kernels or ref_uses_fused_kernels:
+                        raise ValueError("Logit distillation requires disabling fused kernels.")
+                self.loss_fn = partial(
+                    sdpo_ppo_loss,
+                    config=actor_config,
+                    sdpo_config=self.sdpo_config,
+                    teacher_logprob_fn=self._compute_sdpo_teacher_logps_for_loss,
+                )
+            elif self.distillation_enabled:
+                self.loss_fn = partial(
+                    distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
+                )
+            else:
+                self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
+        if self.sdpo_enabled:
+            self._configure_sdpo_teacher()
+
         # 3. build rollout engine
-        # - vllm: vLLMAsyncRollout
-        # - sglang: ServerAdapter
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
+            # TODO: move rollout_device_mesh into ServerAdapter
             # 3.1 build rollout device mesh (sglang need only)
             infer_tp = rollout_config.tensor_model_parallel_size * rollout_config.data_parallel_size
             infer_pp = rollout_config.pipeline_model_parallel_size
@@ -503,40 +648,208 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
             )
 
-            # 3.2 init trainer and rollout random states
-            self.torch_random_states = get_torch_device().get_rng_state()
-            gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
-            get_torch_device().manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
-            self.gen_random_states = get_torch_device().get_rng_state()
-            get_torch_device().set_rng_state(self.torch_random_states)
-
-            # 3.3 initialize rollout engine
+            # 3.2 initialize rollout engine
             rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
             self.rollout = rollout_cls(
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
 
-            # used for LoRA
+            # used for LoRA (base_sync_done is unused in merge-only mode but kept for Phase 2 adapter path)
             self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)
+            self.peft_merge: bool = model_config.lora.get("merge", False)
+
+        # 4. build checkpoint engine
+        if "actor" in self.role:
+            checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
+            backend = checkpoint_engine_config.backend
+            bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
+            engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
+            # If custom_backend_module is set, import it so plugins can register
+            # in CheckpointEngineRegistry before the backend is instantiated.
+            import_external_libs(checkpoint_engine_config.custom_backend_module or None)
+            self.checkpoint_engine = CheckpointEngineRegistry.new(
+                backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
+            )
+
+        # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
+        aggressive_empty_cache(force_sync=True)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("compute_ref_log_prob"): breakpoint()
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
+    @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("compute_log_prob"): breakpoint()
         output = self.actor.infer_batch(data)
+
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
+    @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("update_actor"): breakpoint()
+
         output = self.actor.train_mini_batch(data=data)
+        if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
+            self._update_teacher_ema()
         return output.cpu() if output is not None else None
+
+    def _compute_sdpo_teacher_logps_for_loss(
+        self,
+        data: TensorDict,
+        student_topk_indices: Optional[torch.Tensor] = None,
+        return_all_logps: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Compute SDPO teacher targets inside the actor loss microbatch."""
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("sdpo_teacher_loss"): breakpoint()
+
+        if self.ref is None:
+            raise RuntimeError("SDPO teacher inference requires an initialized ref model.")
+        required_keys = {"teacher_input_ids", "self_distillation_mask"}
+        missing = required_keys - set(data.keys())
+        if missing:
+            raise ValueError(f"SDPO is enabled but required teacher keys are missing: {sorted(missing)}")
+        if has_non_empty_multi_modal_inputs(data):
+            raise ValueError("SDPO does not support multi-modal inputs in actor.update_policy.")
+
+        # Both trainers pass the same fields; the transfer-queue path materializes the teacher
+        # sequence as a nested (no-padding) tensor and we rebuild the padded layout here, while
+        # the legacy path already carries the padded teacher tensors (and precomputed mask/pos).
+        teacher_input_ids = data["teacher_input_ids"]
+        if teacher_input_ids.is_nested:
+            (
+                teacher_input_ids,
+                teacher_attention_mask,
+                teacher_position_ids,
+                responses,
+                response_mask,
+            ) = reconstruct_padded_teacher_from_nested(
+                teacher_input_ids=teacher_input_ids,
+                responses=data["responses"],
+                response_mask=data["response_mask"],
+                pad_token_id=tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+            )
+        else:
+            legacy_keys = {"teacher_attention_mask", "teacher_position_ids"}
+            missing = legacy_keys - set(data.keys())
+            if missing:
+                raise ValueError(f"SDPO is enabled but required teacher keys are missing: {sorted(missing)}")
+            responses = data["responses"]
+            teacher_attention_mask = data["teacher_attention_mask"]
+            teacher_position_ids = data["teacher_position_ids"]
+            response_mask = data["response_mask"]
+
+        teacher_prompt_len = teacher_input_ids.shape[1] - responses.shape[1]
+        teacher_prompts = teacher_input_ids[:, :teacher_prompt_len]
+
+        tensor_dict = {
+            "input_ids": teacher_input_ids,
+            "attention_mask": teacher_attention_mask,
+            "position_ids": teacher_position_ids,
+            "response_mask": response_mask,
+            "responses": responses,
+            "prompts": teacher_prompts,
+        }
+        if student_topk_indices is not None:
+            tensor_dict["student_topk_indices"] = student_topk_indices
+
+        temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+        non_tensor_dict = {
+            "temperature": temperature,
+            "pad_token_id": tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+        }
+        teacher_td = tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
+        teacher_td = left_right_2_no_padding(teacher_td)
+
+        use_logits_processor = return_all_logps or student_topk_indices is not None
+        default_keys = {
+            "use_remove_padding": tu.get_non_tensor_data(
+                data=data, key="use_remove_padding", default=self.ref.model_config.get("use_remove_padding", False)
+            ),
+            "use_dynamic_bsz": False,
+            "max_token_len_per_gpu": None,
+            "micro_batch_size_per_gpu": data.batch_size[0],
+            "use_fused_kernels": tu.get_non_tensor_data(
+                data=data, key="use_fused_kernels", default=self.ref.engine_config.use_fused_kernels
+            ),
+            "calculate_entropy": False,
+            "distillation_use_topk": use_logits_processor,
+        }
+        tu.assign_non_tensor(teacher_td, **default_keys)
+
+        # When full-logit distillation is on (top-k or all-vocab), run the teacher
+        # extractor as the engine's logits processor; otherwise only plain log_probs
+        # are needed. The extractor itself picks top-k vs all-vocab from the data.
+        loss_function = _sdpo_teacher_extractor if use_logits_processor else None
+
+        with self.ref.engine.eval_mode(disable_auto_offload=False):
+            output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)
+        model_output = output["model_output"]
+        result = {"teacher_log_probs": no_padding_2_padding(model_output["log_probs"], teacher_td).float()}
+        if return_all_logps:
+            result["teacher_all_log_probs"] = no_padding_2_padding(model_output["all_logps"], teacher_td).float()
+        elif student_topk_indices is not None:
+            result["teacher_topk_log_probs"] = no_padding_2_padding(model_output["topk_logps"], teacher_td).float()
+        return result
+
+    def _update_teacher_ema(self) -> None:
+        """EMA-update ref model toward actor after gradient step (SDPO)."""
+        if not self.sdpo_enabled or not self._is_ref:
+            return
+        teacher_regularization = self.sdpo_config.teacher_regularization
+        if teacher_regularization != "ema":
+            return
+        update_rate = self._resolve_sdpo_teacher_update_rate()
+        if update_rate == 0.0:
+            return
+        with torch.no_grad():
+            for ref_param, actor_param in zip(
+                self.ref.engine.module.parameters(),
+                self.actor.engine.module.parameters(),
+                strict=False,
+            ):
+                actor_data = actor_param.data.to(device=ref_param.device)
+                ref_param.data.mul_(1.0 - update_rate).add_(actor_data, alpha=update_rate)
+
+    def _configure_sdpo_teacher(self) -> None:
+        if self.ref is None:
+            raise RuntimeError("SDPO teacher inference requires an initialized ref model.")
+        teacher_regularization = self.sdpo_config.teacher_regularization
+        if teacher_regularization != "trust_region":
+            return
+
+        if self.actor is None:
+            raise RuntimeError("SDPO trust_region teacher requires an initialized actor model.")
+        if self.actor.engine_config.use_fused_kernels or self.ref.engine_config.use_fused_kernels:
+            raise ValueError("trust_region teacher requires disabling fused kernels to access logits.")
+        trust_region_teacher = TrustRegionTeacher(
+            ref_module=self.ref.engine.module,
+            student_module=self.actor.engine.module,
+            mix_coef=self._resolve_sdpo_teacher_update_rate(),
+        )
+
+        set_inference_module = getattr(self.ref.engine, "set_inference_module", None)
+        if set_inference_module is None:
+            raise RuntimeError("SDPO trust_region teacher requires an engine that supports an inference module.")
+        set_inference_module(trust_region_teacher)
+
+    def _resolve_sdpo_teacher_update_rate(self) -> float:
+        rate = getattr(self.sdpo_config, "teacher_update_rate", None)
+        legacy = getattr(self.sdpo_config, "ema_update_rate", 0.05)
+        return float(legacy if rate is None else rate)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
@@ -548,42 +861,78 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def sleep(self):
-        """Context switch from rollout mode to trainer mode."""
-        if self.config.rollout.free_cache_engine:
-            log_gpu_memory_usage("Before rollout offload", logger=logger)
-            await self.rollout.release()
-            log_gpu_memory_usage("After rollout offload", logger=logger)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+        """Update weights from trainer to rollout.
 
-        # add empty cache after each compute
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(True)
+        1. For sync training with colocated trainer and rollout, update rollout directly from model engine.
+           - before update_weights: rollout should be in sleep mode.
+           - after update_weights: rollout should be in wake_up mode.
+        2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
 
-        # restore random states
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
+        LoRA handling: when model.lora.merge=True (peft_merge), LoRA is merged into
+        base weights before sync. The engine returns full HF-keyed params with
+        peft_config=None, so the rollout receives a standard weight update.
 
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
-        """Context switch trainer mode to rollout mode."""
-        aggressive_empty_cache(force_sync=True)
+        Args:
+            global_steps: Current global training step count, passed to rollout for logging/tracking.
+            mode: Weight update strategy. Supported values:
+                - ``"auto"``: Automatically resolve to the backend configured in
+                  ``config.rollout.checkpoint_engine.backend`` (default).
+                - ``"naive"``: Direct in-process weight sync between colocated trainer
+                  and rollout. Used for synchronous training where both share the same
+                  process. Rollout must be in sleep mode before this call.
+                - Any other value: Delegates to
+                  :meth:`checkpoint_engine.send_weights` for asynchronous weight
+                  transfer via checkpoint engine, suitable for disaggregated
+                  trainer/rollout deployments.
+        """
+
+        # Resolve mode: "auto" falls back to config, explicit values take precedence
+        effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+
+        # 0. send_weights only for async training with disaggregated trainer and rollout
+        if effective_mode != "naive":
+            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            return
+
         set_expandable_segments(False)
+        log_gpu_memory_usage("Before resume weights", logger=logger)
 
-        # 1. get per tensor generator from engine, this will load model to gpu
-        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
-        )
-
-        # 2. resume weights and update weights
+        # 1. resume rollout memory (weights were released during sleep)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+
+        # 2. determine if we need a base weight sync (adapter path only)
+        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+            layered_summon=self.layered_summon, base_sync_done=True
+        )
+
+        do_lora_base_sync = False
+        if not self.peft_merge and peft_config is not None:
+            self.rollout.sleep_level = 1
+            do_lora_base_sync = not self.base_sync_done
+
+        # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
+        if do_lora_base_sync:
+            per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
+                layered_summon=self.layered_summon, base_sync_done=False
+            )
+            await self.rollout.update_weights(
+                per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
+            )
+
+        await self.rollout.update_weights(
+            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+        )
+
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         # 3. offload model to cpu
-        self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+        if self.actor.engine.is_param_offload_enabled:
+            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache
@@ -592,30 +941,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
-        # important: need to manually set the random states of each tp to be identical.
-        self.torch_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.gen_random_states)
+        set_expandable_segments(True)
 
-    # ============================ vLLM related ============================
+    @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
+    def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        """Execute checkpoint engine method.
 
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def get_zeromq_address(self):
-        return self.rollout.get_zeromq_address()
+        Args:
+            method (str): Checkpoint engine method name.
+            *args: Variable length argument list.
+            **kwargs: Arbitrary keyword arguments.
 
-    # ============================ SGLang related ============================
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def chat_completion(self, json_request):
-        ret = await self.rollout.chat_completion(json_request)
-        return ret
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def generate(
-        self,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        request_id: str,
-        image_data: Optional[list[Any]] = None,
-    ) -> list[int]:
-        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
-        return ret
+        """
+        return getattr(self.checkpoint_engine, method)(*args, **kwargs)
